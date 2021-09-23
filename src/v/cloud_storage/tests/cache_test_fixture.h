@@ -11,7 +11,9 @@
 #pragma once
 #include "cloud_storage/cache_service.h"
 #include "seastarx.h"
+#include "units.h"
 
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/seastar.hh>
 
 #include <boost/filesystem/operations.hpp>
@@ -33,7 +35,7 @@ public:
     cloud_storage::cache cache_service;
 
     cache_test_fixture()
-      : cache_service(CACHE_DIR) {
+      : cache_service(CACHE_DIR, 100_GiB, ss::lowres_clock::duration(100)) {
         cache_service.start().get();
     }
 

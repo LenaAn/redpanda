@@ -24,26 +24,98 @@
 
 #include <cloud_storage/cache_service.h>
 
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <system_error>
 
 namespace cloud_storage {
 
-cache::cache(std::filesystem::path cache_dir) noexcept
+cache::cache(
+  std::filesystem::path cache_dir,
+  size_t max_cache_size,
+  ss::lowres_clock::duration check_period) noexcept
   : _cache_dir(std::move(cache_dir))
+  , _max_cache_size(max_cache_size)
+  , _check_period(check_period)
   , _cnt(0) {}
+
+// deletes cache files starting with oldest
+ss::future<> cache::clean_up_cache() {
+    gate_guard guard{_gate};
+    std::cout << "\nstart walking " << _cache_dir << "\n" << std::flush;
+    co_await _walker.walk(_cache_dir.native());
+    std::cout << "finished walking! " << _cache_dir << "\n" << std::flush;
+
+    std::cout << "_walker.cache_size: " << _walker.cache_size << "\n"
+              << std::flush;
+    std::cout << "_max_cache_size: " << _max_cache_size << "\n" << std::flush;
+    if (_walker.cache_size >= _max_cache_size) {
+        std::cout << "_walker.cache_size >= _max_cache_size\n";
+        auto to_delete = _walker.cache_size - (_max_cache_size * 4 / 5);
+        std::cout << "to_delete: " << to_delete << "\n" << std::flush;
+
+        auto candidates_for_deletion = _walker.files;
+
+        std::cout << "we have " << candidates_for_deletion.size()
+                  << " files to delete\n";
+        std::cout << "first for deletion: "
+                  << candidates_for_deletion[0].filename << "\n"
+                  << std::flush;
+        uint64_t deleted = 0;
+        size_t i_to_delete = 0;
+        while (deleted < to_delete) {
+            auto next_to_delete = candidates_for_deletion[i_to_delete];
+            i_to_delete++;
+            // todo: don't delete .part file that are being written
+            // open file exclusively before deleting
+
+            std::cout << "next_to_delete.size: " << next_to_delete.size << "\n"
+                      << std::flush;
+
+            bool deleted_filename = true;
+            auto file_to_remove = next_to_delete.filename;
+
+            ss::file file_part;
+            try {
+                co_await ss::remove_file(file_to_remove);
+            } catch (std::exception& e) {
+                deleted_filename = false;
+                std::cout << "couldn't delete " << file_to_remove << ": "
+                          << e.what() << " \n"
+                          << std::flush;
+            }
+            if (deleted_filename) {
+                std::cout << "successfully deleted " << file_to_remove << "\n"
+                          << std::flush;
+                deleted += next_to_delete.size;
+            }
+        }
+        total_cleaned += deleted;
+    }
+}
 
 ss::future<> cache::start() {
     vlog(cst_log.debug, "Starting archival cache service");
-    // todo: start maintenance cycle here
+
+    // todo: we can implement more optimal cache eviction
+    _timer.set_callback([this] {
+        if (ss::this_shard_id() == 0) {
+            return clean_up_cache();
+        }
+        return ss::make_ready_future<>();
+    });
+
+    _timer.arm_periodic(_check_period);
     return ss::make_ready_future<>();
 }
 
 ss::future<> cache::stop() {
     vlog(cst_log.debug, "Stopping archival cache service");
+    _timer.cancel();
     return _gate.close();
 }
 
