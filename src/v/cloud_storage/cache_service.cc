@@ -9,7 +9,6 @@
  */
 
 #include "cloud_storage/logger.h"
-#include "random/generators.h"
 #include "utils/gate_guard.h"
 #include "vlog.h"
 
@@ -17,20 +16,14 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/print.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
-#include <seastar/util/defer.hh>
 
 #include <cloud_storage/cache_service.h>
 
-#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <optional>
-#include <ostream>
-#include <string>
-#include <system_error>
 
 namespace cloud_storage {
 
@@ -43,65 +36,52 @@ cache::cache(
   , _check_period(check_period)
   , _cnt(0) {}
 
-// deletes cache files starting with oldest
 ss::future<> cache::clean_up_cache() {
     gate_guard guard{_gate};
-    std::cout << "\nstart walking " << _cache_dir << "\n" << std::flush;
     co_await _walker.walk(_cache_dir.native());
-    std::cout << "finished walking! " << _cache_dir << "\n" << std::flush;
 
-    std::cout << "_walker.cache_size: " << _walker.cache_size << "\n"
-              << std::flush;
-    std::cout << "_max_cache_size: " << _max_cache_size << "\n" << std::flush;
     if (_walker.cache_size >= _max_cache_size) {
-        std::cout << "_walker.cache_size >= _max_cache_size\n";
-        auto to_delete = _walker.cache_size - (_max_cache_size * 4 / 5);
-        std::cout << "to_delete: " << to_delete << "\n" << std::flush;
+        auto size_to_delete = _walker.cache_size
+                              - (_max_cache_size * _cache_size_low_watermark);
 
         auto candidates_for_deletion = _walker.files;
 
-        std::cout << "we have " << candidates_for_deletion.size()
-                  << " files to delete\n";
-        std::cout << "first for deletion: "
-                  << candidates_for_deletion[0].filename << "\n"
-                  << std::flush;
-        uint64_t deleted = 0;
+        uint64_t deleted_size = 0;
         size_t i_to_delete = 0;
-        while (deleted < to_delete) {
-            auto next_to_delete = candidates_for_deletion[i_to_delete];
-            i_to_delete++;
+        while (deleted_size < size_to_delete) {
             // todo: don't delete .part file that are being written
             // open file exclusively before deleting
+            bool successfully_deleted = true;
+            auto file_to_remove = candidates_for_deletion[i_to_delete].filename;
 
-            std::cout << "next_to_delete.size: " << next_to_delete.size << "\n"
-                      << std::flush;
-
-            bool deleted_filename = true;
-            auto file_to_remove = next_to_delete.filename;
-
-            ss::file file_part;
             try {
                 co_await ss::remove_file(file_to_remove);
             } catch (std::exception& e) {
-                deleted_filename = false;
-                std::cout << "couldn't delete " << file_to_remove << ": "
-                          << e.what() << " \n"
-                          << std::flush;
+                successfully_deleted = false;
+                vlog(
+                  cst_log.error,
+                  "Cache eviction couldn't delete {}: {}.",
+                  file_to_remove,
+                  e.what());
             }
-            if (deleted_filename) {
-                std::cout << "successfully deleted " << file_to_remove << "\n"
-                          << std::flush;
-                deleted += next_to_delete.size;
+            if (successfully_deleted) {
+                deleted_size += candidates_for_deletion[i_to_delete].size;
             }
+            i_to_delete++;
         }
-        total_cleaned += deleted;
+        total_cleaned += deleted_size;
+        vlog(
+          cst_log.debug,
+          "Cache eviction deleted {} files of total size {}.",
+          i_to_delete,
+          deleted_size);
     }
 }
 
 ss::future<> cache::start() {
     vlog(cst_log.debug, "Starting archival cache service");
 
-    // todo: we can implement more optimal cache eviction
+    // todo: implement more optimal cache eviction
     _timer.set_callback([this] {
         if (ss::this_shard_id() == 0) {
             return clean_up_cache();
@@ -124,6 +104,7 @@ ss::future<std::optional<cache_item>> cache::get(std::filesystem::path key) {
     vlog(cst_log.debug, "Trying to get {} from archival cache.", key.native());
     ss::file cache_file;
     try {
+        // todo: update access time, this will be used by cache eviction
         cache_file = co_await ss::open_file_dma(
           (_cache_dir / key).native(), ss::open_flags::ro);
     } catch (std::filesystem::filesystem_error& e) {

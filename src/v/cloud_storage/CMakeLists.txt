@@ -16,3 +16,4 @@ v_cc_library(
     v::rphashing
 )
 add_subdirectory(tests)
+add_subdirectory(cache_demo)
